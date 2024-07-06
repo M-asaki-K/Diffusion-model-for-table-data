@@ -10,13 +10,22 @@ from tqdm import tqdm
 import math
 import matplotlib.pyplot as plt
 from PIL import Image
+from sklearn.metrics import mean_squared_error, r2_score
+import os
 
 # ハイパーパラメータの設定
 batch_size = 128
 num_timesteps = 1000
-epochs = 30
+epochs = 1
 lr = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+loss_type = "mse"
+
+# フォルダの作成
+experiment_name = f"batch_size_{batch_size}_num_timesteps_{num_timesteps}_epochs_{epochs}_lr_{lr}_loss_{loss_type}"
+experiment_dir = os.path.join("experiments", experiment_name)
+os.makedirs(experiment_dir, exist_ok=True)
 
 # CSVデータの読み込み
 data = pd.read_csv('change.csv')
@@ -138,8 +147,13 @@ def pos_encoding(timesteps, time_embed_dim):
     pos_enc = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
     return pos_enc
 
+# 画像の保存関数
+def save_plot(fig, filename):
+    fig.savefig(os.path.join(experiment_dir, filename))
 
-
+# データフレームの保存関数
+def save_dataframe(df, filename):
+    df.to_csv(os.path.join(experiment_dir, filename), index=False)
 
 # Diffuserクラスの定義
 class Diffuser:
@@ -189,8 +203,8 @@ class Diffuser:
         return mu + noise * std
 
     def reverse_to_img(self, x):
-        x = x * 255
-        x = x.clamp(0, 255)
+        x = x * 1
+#        x = x.clamp(0, 255)
         x = x.to(torch.uint8)
         x = x.cpu()
         to_pil = transforms.ToPILImage()
@@ -229,7 +243,8 @@ for epoch in range(epochs):
 
         x_noisy, noise = diffuser.add_noise(x, t)
         noise_pred = model(x_noisy, t, labels)
-        loss = F.mse_loss(noise, noise_pred)
+        if loss_type == "mse":
+            loss = F.mse_loss(noise, noise_pred)
 
         loss.backward()
         optimizer.step()
@@ -241,47 +256,146 @@ for epoch in range(epochs):
     losses.append(loss_avg)
     print(f'Epoch {epoch} | Loss: {loss_avg}')
 
-# 損失のプロット
-plt.plot(losses)
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.show()
+# 損失のプロットを保存
+fig, ax = plt.subplots()
+ax.plot(losses)
+ax.set_xlabel('Epoch')
+ax.set_ylabel('Loss')
+ax.set_title('Loss over Epochs')
+save_plot(fig, "losses.png")
 
 # サンプル生成
 images, labels = diffuser.sample(model)
 
+# サンプル画像の表示と保存
 def show_samples(images, labels, columns=3, image_size=(5, 5)):
     num_samples = len(images)
     rows = (num_samples + columns - 1) // columns
-    plt.figure(figsize=(image_size[0] * columns, image_size[1] * rows))
+    fig, axes = plt.subplots(rows, columns, figsize=(image_size[0] * columns, image_size[1] * rows))
     
     for i in range(num_samples):
-        plt.subplot(rows, columns, i + 1)
+        ax = axes[i // columns, i % columns]
         img_array = np.array(images[i])
-        plt.imshow(img_array, cmap='gray')
-        plt.title(f"Label: {labels[i]}", fontsize=8, pad=20)  # Adjust fontsize and pad for spacing
-        plt.axis('off')
+        ax.imshow(img_array, cmap='gray')
+        ax.set_title(f"Label: {labels[i]}", fontsize=8, pad=20)  # Adjust fontsize and pad for spacing
+        ax.axis('off')
     
     plt.subplots_adjust(wspace=0.3, hspace=0.6)  # Adjust the spacing between subplots
-    plt.show()
-    
+    save_plot(fig, "sample_images.png")
+        
 show_samples(images, labels)
 
-def save_images_to_dataframe(images, labels, output_csv="images_labels.csv"):
+def save_images_to_dataframe(images, labels):
     # Flatten the image arrays and convert them to lists
     flattened_images = [np.array(image).flatten().tolist() for image in images]
     
+    # Move labels to CPU if necessary
+    if labels.is_cuda:
+        labels = labels.cpu()
+    
+    # Convert labels to numpy
+    labels_np = labels.numpy()
+    
     # Create a DataFrame with the image data and labels
     data = {
-        "label": labels,
+        "label": labels_np,
         "image_data": flattened_images
     }
     df = pd.DataFrame(data)
     
     # Save the DataFrame to a CSV file
-    df.to_csv(output_csv, index=False)
-    print(f"DataFrame saved to {output_csv}")
+    save_dataframe(df, "images_labels.csv")
+    print(f"DataFrame saved")
     
-
 # Save images and labels to DataFrame
 save_images_to_dataframe(images, labels)
+
+# CSVファイルからデータを読み取る関数
+def load_images_labels_from_csv(csv_path):
+    df = pd.read_csv(csv_path)
+    labels = df['label'].values
+    image_data = df['image_data'].apply(eval).values  # Convert string representation of list to actual list
+    return labels, image_data
+
+# 金額を計算する関数
+def calculate_amount(image_data):
+    # 10000円札、5000円札、1000円札、500円玉、100円玉、50円玉、10円玉、5円玉、1円玉
+    denominations = [10000, 5000, 1000, 500, 100, 50, 10, 5, 1]
+    return sum([d * n for d, n in zip(denominations, image_data)])
+
+# 元のデータと生成されたデータの比較
+def compare_data(labels, image_data):
+    calculated_amounts = [calculate_amount(data) for data in image_data]
+    differences = np.abs(labels - calculated_amounts)
+    avg_difference = np.mean(differences)
+    return avg_difference, calculated_amounts, differences
+
+# 枚数制約の定義
+max_counts = {
+    10000: np.inf,  # 無制限
+    5000: 1,
+    1000: 4,
+    500: 1,
+    100: 4,
+    50: 1,
+    10: 4,
+    5: 1,
+    1: 4
+}
+
+# 制約違反率を計算する関数
+def calculate_violation_rate(image_data):
+    total_violations = 0
+    total_checks = 0
+    for data in image_data:
+        for i, count in enumerate(data):
+            denomination = list(max_counts.keys())[i]
+            if count > max_counts[denomination]:
+                total_violations += 1
+            total_checks += 1
+    violation_rate = total_violations / total_checks
+    return violation_rate
+
+# CSVファイルからデータを読み取る
+labels, image_data = load_images_labels_from_csv(os.path.join(experiment_dir, "images_labels.csv"))
+
+# 比較を行い結果を表示
+avg_difference, calculated_amounts, differences = compare_data(labels, image_data)
+print(f'Average difference between original labels and calculated amounts: {avg_difference}')
+
+# R2, MSE, RMSEの計算
+mse = mean_squared_error(labels, calculated_amounts)
+rmse = np.sqrt(mse)
+r2 = r2_score(labels, calculated_amounts)
+
+print(f'MSE: {mse}')
+print(f'RMSE: {rmse}')
+print(f'R2 Score: {r2}')
+
+# y-yプロットの作成と保存
+fig, ax = plt.subplots()
+ax.scatter(labels, calculated_amounts, alpha=0.5)
+ax.plot([min(labels), max(labels)], [min(labels), max(labels)], 'r--')
+ax.set_xlabel('True Values')
+ax.set_ylabel('Predicted Values')
+ax.set_title('y-y Plot')
+save_plot(fig, "yy_plot.png")
+
+# 詳細な結果を表示
+for i, (label, calc_amount, diff) in enumerate(zip(labels, calculated_amounts, differences)):
+    print(f'Row {i}: Label = {label}, Calculated Amount = {calc_amount}, Difference = {diff}')
+
+# 制約違反率を計算
+violation_rate = calculate_violation_rate(image_data)
+print(f'Violation Rate: {violation_rate}')
+
+# 評価結果の保存
+evaluation_results = {
+    "MSE": mse,
+    "RMSE": rmse,
+    "R2 Score": r2,
+    "Violation Rate": violation_rate
+}
+with open(os.path.join(experiment_dir, "evaluation_results.txt"), "w") as f:
+    for key, value in evaluation_results.items():
+        f.write(f"{key}: {value}\n")
