@@ -12,20 +12,9 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from sklearn.metrics import mean_squared_error, r2_score
 import os
+import optuna
 
-# ハイパーパラメータの設定
-batch_size = 128
-num_timesteps = 1000
-epochs = 1
-lr = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-loss_type = "mse"
-
-# フォルダの作成
-experiment_name = f"batch_size_{batch_size}_num_timesteps_{num_timesteps}_epochs_{epochs}_lr_{lr}_loss_{loss_type}"
-experiment_dir = os.path.join("experiments", experiment_name)
-os.makedirs(experiment_dir, exist_ok=True)
 
 # CSVデータの読み込み
 data = pd.read_csv('change.csv')
@@ -51,7 +40,6 @@ class CoinDataset(Dataset):
 
 # データローダーの設定
 dataset = CoinDataset(data, labels)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 # 位置エンベディング関数の定義
 def _pos_encoding(time_idx, output_dim, device = "gpu"):
@@ -100,14 +88,14 @@ class ConvBlock(nn.Module):
         return y
 
 class UNetCond(nn.Module):
-    def __init__(self, in_ch=1, time_embed_dim=100, num_labels=None):
+    def __init__(self, in_ch=1, time_embed_dim=100, down_channels=8, up_channels=16, num_labels=None):
         super().__init__()
         self.time_embed_dim = time_embed_dim
 
-        self.down1 = ConvBlock(in_ch, 8, time_embed_dim)
-        self.bot1 = ConvBlock(8, 16, time_embed_dim)
-        self.up1 = ConvBlock(16 + 8, 8, time_embed_dim)
-        self.out = nn.Conv2d(8, in_ch, 1)
+        self.down1 = ConvBlock(in_ch, down_channels, time_embed_dim)
+        self.bot1 = ConvBlock(down_channels, up_channels, time_embed_dim)
+        self.up1 = ConvBlock(up_channels + down_channels, down_channels, time_embed_dim)
+        self.out = nn.Conv2d(down_channels, in_ch, 1)
 
         self.maxpool = nn.MaxPool2d(2)
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
@@ -146,14 +134,6 @@ def pos_encoding(timesteps, time_embed_dim):
     emb = timesteps[:, None] * emb[None, :]
     pos_enc = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
     return pos_enc
-
-# 画像の保存関数
-def save_plot(fig, filename):
-    fig.savefig(os.path.join(experiment_dir, filename))
-
-# データフレームの保存関数
-def save_dataframe(df, filename):
-    df.to_csv(os.path.join(experiment_dir, filename), index=False)
 
 # Diffuserクラスの定義
 class Diffuser:
@@ -223,92 +203,6 @@ class Diffuser:
         images = [self.reverse_to_img(x[i]) for i in range(batch_size)]
         return images, labels
 
-# モデルの初期化
-diffuser = Diffuser(num_timesteps, device=device)
-model = UNetCond(num_labels=1000001).to(device)
-model.to(device)
-optimizer = Adam(model.parameters(), lr=lr)
-
-# 訓練ループ
-losses = []
-for epoch in range(epochs):
-    loss_sum = 0.0
-    cnt = 0
-
-    for images, labels in tqdm(dataloader):
-        optimizer.zero_grad()
-        x = images.to(device)
-        labels = labels.to(device)
-        t = torch.randint(1, num_timesteps+1, (len(x),), device=device)
-
-        x_noisy, noise = diffuser.add_noise(x, t)
-        noise_pred = model(x_noisy, t, labels)
-        if loss_type == "mse":
-            loss = F.mse_loss(noise, noise_pred)
-
-        loss.backward()
-        optimizer.step()
-
-        loss_sum += loss.item()
-        cnt += 1
-
-    loss_avg = loss_sum / cnt
-    losses.append(loss_avg)
-    print(f'Epoch {epoch} | Loss: {loss_avg}')
-
-# 損失のプロットを保存
-fig, ax = plt.subplots()
-ax.plot(losses)
-ax.set_xlabel('Epoch')
-ax.set_ylabel('Loss')
-ax.set_title('Loss over Epochs')
-save_plot(fig, "losses.png")
-
-# サンプル生成
-images, labels = diffuser.sample(model)
-
-# サンプル画像の表示と保存
-def show_samples(images, labels, columns=3, image_size=(5, 5)):
-    num_samples = len(images)
-    rows = (num_samples + columns - 1) // columns
-    fig, axes = plt.subplots(rows, columns, figsize=(image_size[0] * columns, image_size[1] * rows))
-    
-    for i in range(num_samples):
-        ax = axes[i // columns, i % columns]
-        img_array = np.array(images[i])
-        ax.imshow(img_array, cmap='gray')
-        ax.set_title(f"Label: {labels[i]}", fontsize=8, pad=20)  # Adjust fontsize and pad for spacing
-        ax.axis('off')
-    
-    plt.subplots_adjust(wspace=0.3, hspace=0.6)  # Adjust the spacing between subplots
-    save_plot(fig, "sample_images.png")
-        
-show_samples(images, labels)
-
-def save_images_to_dataframe(images, labels):
-    # Flatten the image arrays and convert them to lists
-    flattened_images = [np.array(image).flatten().tolist() for image in images]
-    
-    # Move labels to CPU if necessary
-    if labels.is_cuda:
-        labels = labels.cpu()
-    
-    # Convert labels to numpy
-    labels_np = labels.numpy()
-    
-    # Create a DataFrame with the image data and labels
-    data = {
-        "label": labels_np,
-        "image_data": flattened_images
-    }
-    df = pd.DataFrame(data)
-    
-    # Save the DataFrame to a CSV file
-    save_dataframe(df, "images_labels.csv")
-    print(f"DataFrame saved")
-    
-# Save images and labels to DataFrame
-save_images_to_dataframe(images, labels)
 
 # CSVファイルからデータを読み取る関数
 def load_images_labels_from_csv(csv_path):
@@ -355,47 +249,174 @@ def calculate_violation_rate(image_data):
             total_checks += 1
     violation_rate = total_violations / total_checks
     return violation_rate
+        
+def objective(trial):
+    # ハイパーパラメータの設定
+    batch_size = trial.suggest_int("batch_size", 32, 128)
+    num_timesteps = trial.suggest_int("num_timesteps", 100, 3000)
+    epochs = trial.suggest_int("epochs", 10, 30)
+    lr = trial.suggest_loguniform("lr", 1e-4, 1e-2)
+    down_channels = trial.suggest_int("down_channels", 4, 64)
+    up_channels = trial.suggest_int("up_channels", 4, 64)
+    loss_type = "mse"# ハイパーパラメータの設定
 
-# CSVファイルからデータを読み取る
-labels, image_data = load_images_labels_from_csv(os.path.join(experiment_dir, "images_labels.csv"))
+    # フォルダの作成
+    experiment_name = f"batch_size_{batch_size}_num_timesteps_{num_timesteps}_epochs_{epochs}_lr_{lr}_loss_{loss_type}_down_channels_{down_channels}_up_channels_{up_channels}"
+    experiment_dir = os.path.join("experiments", experiment_name)
+    os.makedirs(experiment_dir, exist_ok=True)
+    
+    # 画像の保存関数
+    def save_plot(fig, filename):
+        fig.savefig(os.path.join(experiment_dir, filename))
 
-# 比較を行い結果を表示
-avg_difference, calculated_amounts, differences = compare_data(labels, image_data)
-print(f'Average difference between original labels and calculated amounts: {avg_difference}')
+    # データフレームの保存関数
+    def save_dataframe(df, filename):
+        df.to_csv(os.path.join(experiment_dir, filename), index=False)
+        
+    # サンプル画像の表示と保存
+    def show_samples(images, labels, columns=3, image_size=(5, 5)):
+        num_samples = len(images)
+        rows = (num_samples + columns - 1) // columns
+        fig, axes = plt.subplots(rows, columns, figsize=(image_size[0] * columns, image_size[1] * rows))
+        
+        for i in range(num_samples):
+            ax = axes[i // columns, i % columns]
+            img_array = np.array(images[i])
+            ax.imshow(img_array, cmap='gray')
+            ax.set_title(f"Label: {labels[i]}", fontsize=8, pad=20)  # Adjust fontsize and pad for spacing
+            ax.axis('off')
+        
+        plt.subplots_adjust(wspace=0.3, hspace=0.6)  # Adjust the spacing between subplots
+        save_plot(fig, "sample_images.png")
 
-# R2, MSE, RMSEの計算
-mse = mean_squared_error(labels, calculated_amounts)
-rmse = np.sqrt(mse)
-r2 = r2_score(labels, calculated_amounts)
+    def save_images_to_dataframe(images, labels):
+        # Flatten the image arrays and convert them to lists
+        flattened_images = [np.array(image).flatten().tolist() for image in images]
+        
+        # Move labels to CPU if necessary
+        if labels.is_cuda:
+            labels = labels.cpu()
+        
+        # Convert labels to numpy
+        labels_np = labels.numpy()
+        
+        # Create a DataFrame with the image data and labels
+        data = {
+            "label": labels_np,
+            "image_data": flattened_images
+        }
+        df = pd.DataFrame(data)
+        
+        # Save the DataFrame to a CSV file
+        save_dataframe(df, "images_labels.csv")
+        print(f"DataFrame saved")
 
-print(f'MSE: {mse}')
-print(f'RMSE: {rmse}')
-print(f'R2 Score: {r2}')
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-# y-yプロットの作成と保存
-fig, ax = plt.subplots()
-ax.scatter(labels, calculated_amounts, alpha=0.5)
-ax.plot([min(labels), max(labels)], [min(labels), max(labels)], 'r--')
-ax.set_xlabel('True Values')
-ax.set_ylabel('Predicted Values')
-ax.set_title('y-y Plot')
-save_plot(fig, "yy_plot.png")
+    # モデルの初期化
+    diffuser = Diffuser(num_timesteps, device=device)
+    model = UNetCond(down_channels=down_channels, up_channels=up_channels, num_labels=1000001).to(device)
+    model.to(device)
+    optimizer = Adam(model.parameters(), lr=lr)
 
-# 詳細な結果を表示
-for i, (label, calc_amount, diff) in enumerate(zip(labels, calculated_amounts, differences)):
-    print(f'Row {i}: Label = {label}, Calculated Amount = {calc_amount}, Difference = {diff}')
+    # 訓練ループ
+    losses = []
+    for epoch in range(epochs):
+        loss_sum = 0.0
+        cnt = 0
 
-# 制約違反率を計算
-violation_rate = calculate_violation_rate(image_data)
-print(f'Violation Rate: {violation_rate}')
+        for images, labels in tqdm(dataloader):
+            optimizer.zero_grad()
+            x = images.to(device)
+            labels = labels.to(device)
+            t = torch.randint(1, num_timesteps+1, (len(x),), device=device)
 
-# 評価結果の保存
-evaluation_results = {
-    "MSE": mse,
-    "RMSE": rmse,
-    "R2 Score": r2,
-    "Violation Rate": violation_rate
-}
-with open(os.path.join(experiment_dir, "evaluation_results.txt"), "w") as f:
-    for key, value in evaluation_results.items():
-        f.write(f"{key}: {value}\n")
+            x_noisy, noise = diffuser.add_noise(x, t)
+            noise_pred = model(x_noisy, t, labels)
+            if loss_type == "mse":
+                loss = F.mse_loss(noise, noise_pred)
+
+            loss.backward()
+            optimizer.step()
+
+            loss_sum += loss.item()
+            cnt += 1
+
+        loss_avg = loss_sum / cnt
+        losses.append(loss_avg)
+        print(f'Epoch {epoch} | Loss: {loss_avg}')
+
+    # 損失のプロットを保存
+    fig, ax = plt.subplots()
+    ax.plot(losses)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('Loss over Epochs')
+    save_plot(fig, "losses.png")
+
+    # サンプル生成
+    images, labels = diffuser.sample(model)
+    show_samples(images, labels)
+        
+    # Save images and labels to DataFrame
+    save_images_to_dataframe(images, labels)
+
+    # CSVファイルからデータを読み取る
+    labels, image_data = load_images_labels_from_csv(os.path.join(experiment_dir, "images_labels.csv"))
+
+    # 比較を行い結果を表示
+    avg_difference, calculated_amounts, differences = compare_data(labels, image_data)
+    print(f'Average difference between original labels and calculated amounts: {avg_difference}')
+
+    # R2, MSE, RMSEの計算
+    mse = mean_squared_error(labels, calculated_amounts)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(labels, calculated_amounts)
+
+    print(f'MSE: {mse}')
+    print(f'RMSE: {rmse}')
+    print(f'R2 Score: {r2}')
+
+    # y-yプロットの作成と保存
+    fig, ax = plt.subplots()
+    ax.scatter(labels, calculated_amounts, alpha=0.5)
+    ax.plot([min(labels), max(labels)], [min(labels), max(labels)], 'r--')
+    ax.set_xlabel('True Values')
+    ax.set_ylabel('Predicted Values')
+    ax.set_title('y-y Plot')
+    save_plot(fig, "yy_plot.png")
+
+    # 詳細な結果を表示
+    for i, (label, calc_amount, diff) in enumerate(zip(labels, calculated_amounts, differences)):
+        print(f'Row {i}: Label = {label}, Calculated Amount = {calc_amount}, Difference = {diff}')
+
+    # 制約違反率を計算
+    violation_rate = calculate_violation_rate(image_data)
+    print(f'Violation Rate: {violation_rate}')
+
+    # 評価結果の保存
+    evaluation_results = {
+        "MSE": mse,
+        "RMSE": rmse,
+        "R2 Score": r2,
+        "Violation Rate": violation_rate
+    }
+    with open(os.path.join(experiment_dir, "evaluation_results.txt"), "w") as f:
+        for key, value in evaluation_results.items():
+            f.write(f"{key}: {value}\n")
+            
+    return rmse
+
+# Optunaによる最適化
+study = optuna.create_study(direction="minimize")
+study.optimize(objective, n_trials=30)
+
+# 最適なパラメータの表示
+print("Best trial:")
+trial = study.best_trial
+
+print("  Value: ", trial.value)
+
+print("  Params: ")
+for key, value in trial.params.items():
+    print(f"    {key}: {value}")
