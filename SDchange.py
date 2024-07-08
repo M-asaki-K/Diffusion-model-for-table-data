@@ -224,9 +224,19 @@ def compare_data(labels, image_data):
     avg_difference = np.mean(differences)
     return avg_difference, calculated_amounts, differences
 
+# 制約違反度合いを計算する関数
+def calculate_constraint_violation(tensor_data):
+    total_violations = 0
+    for data in tensor_data:
+        for i, count in enumerate(data):
+            denomination = list(max_counts.keys())[i]
+            if count > max_counts[denomination]:
+                total_violations += (count - max_counts[denomination])  # 違反した枚数をカウント
+    return total_violations
+
 # 枚数制約の定義
 max_counts = {
-    10000: np.inf,  # 無制限
+    10000: 100,  
     5000: 1,
     1000: 4,
     500: 1,
@@ -236,6 +246,37 @@ max_counts = {
     5: 1,
     1: 4
 }
+
+def calculate_constraint_violation(tensor_data):
+    max_counts = torch.tensor([
+        100,  # 10000円札: 無制限
+        1,             # 5000円札: 最大1枚
+        4,             # 1000円札: 最大4枚
+        1,             # 500円玉: 最大1枚
+        4,             # 100円玉: 最大4枚
+        1,             # 50円玉: 最大1枚
+        4,             # 10円玉: 最大4枚
+        1,             # 5円玉: 最大1枚
+        4              # 1円玉: 最大4枚
+    ], device=tensor_data.device)
+
+    # データをフラット化
+    flat_data = tensor_data.view(tensor_data.size(0), -1)
+
+    # 負の値を制約違反としてカウント
+    negative_violations = flat_data.clamp(max=0).abs().sum()
+
+    # 0以上にクランプ
+    flat_data = flat_data.clamp(min=0)
+
+    # 各バッチごとに制約違反を計算
+    violations = torch.sum(flat_data - max_counts, dim=1)
+    violations = violations.clamp(min=0)  # 違反していない場合は0にクランプ
+
+    # 総違反数を計算（負の値の違反数を含む）
+    total_violations = violations.sum() + negative_violations
+    return total_violations
+
 
 # 制約違反率を計算する関数
 def calculate_violation_rate(image_data):
@@ -249,19 +290,46 @@ def calculate_violation_rate(image_data):
             total_checks += 1
     violation_rate = total_violations / total_checks
     return violation_rate
+
+def calculate_amount_penalty(tensor_data, labels):
+    denominations = torch.tensor([10000, 5000, 1000, 500, 100, 50, 10, 5, 1], device=tensor_data.device)
+    flat_data = tensor_data.view(tensor_data.size(0), -1)
+    total_amount = torch.sum(flat_data * denominations, dim=1)
+
+    # 支払い金額とラベルの差の絶対値をペナルティとして計算
+    amount_penalty = torch.sum(torch.abs(total_amount - labels)).float()
+
+    return amount_penalty
+
+def calculate_r2_penalty(tensor_data, labels):
+    denominations = torch.tensor([10000, 5000, 1000, 500, 100, 50, 10, 5, 1], device=tensor_data.device)
+    flat_data = tensor_data.view(tensor_data.size(0), -1)
+    total_amount = torch.sum(flat_data * denominations, dim=1)
+
+    # 支払い金額とラベルの差の絶対値をペナルティとして計算
+    labels = labels.float()  # labelsを浮動小数点数型に変換
+    ss_res = torch.sum((total_amount - labels) ** 2)
+    ss_tot = torch.sum((labels - torch.mean(labels)) ** 2)
+    r2_score = 1 - (ss_res / ss_tot)
+    
+    # ペナルティとして1 - R²を返す
+    penalty = 1 - r2_score
+
+    return penalty
         
 def objective(trial):
     # ハイパーパラメータの設定
-    batch_size = trial.suggest_int("batch_size", 32, 128)
-    num_timesteps = trial.suggest_int("num_timesteps", 100, 3000)
-    epochs = trial.suggest_int("epochs", 10, 30)
-    lr = trial.suggest_loguniform("lr", 1e-4, 1e-2)
-    down_channels = trial.suggest_int("down_channels", 4, 64)
-    up_channels = trial.suggest_int("up_channels", 4, 64)
-    loss_type = "mse"# ハイパーパラメータの設定
+    batch_size = trial.suggest_categorical("batch_size", [32, 64, 96, 128])
+    num_timesteps = trial.suggest_categorical("num_timesteps", [500, 1000, 1500, 2000, 3000])
+    epochs = trial.suggest_categorical("epochs", [30, 40, 50, 60])
+    lr = trial.suggest_loguniform("lr", 5e-5, 1e-3)
+    down_channels = trial.suggest_categorical("down_channels", [5, 7, 9, 13, 17, 20, 30, 50])
+    up_channels = trial.suggest_categorical("up_channels", [5, 7, 9, 13, 17, 20, 30, 50])
+    penalty_weight = trial.suggest_loguniform("penalty_weight", 1e-9, 1e-5)  # 制約違反のペナルティの重み
+    loss_type = "combined_amount"# ハイパーパラメータの設定
 
     # フォルダの作成
-    experiment_name = f"batch_size_{batch_size}_num_timesteps_{num_timesteps}_epochs_{epochs}_lr_{lr}_loss_{loss_type}_down_channels_{down_channels}_up_channels_{up_channels}"
+    experiment_name = f"batch_size_{batch_size}_num_timesteps_{num_timesteps}_epochs_{epochs}_lr_{lr}_loss_{loss_type}_down_channels_{down_channels}_up_channels_{up_channels}_mpenalty_weight_{penalty_weight}"
     experiment_dir = os.path.join("experiments", experiment_name)
     os.makedirs(experiment_dir, exist_ok=True)
     
@@ -333,8 +401,28 @@ def objective(trial):
 
             x_noisy, noise = diffuser.add_noise(x, t)
             noise_pred = model(x_noisy, t, labels)
+            
+            # デノイズされたデータを取得
+            alpha = diffuser.alphas[t-1].view(-1, 1, 1, 1).to(device)
+            alpha_bar = diffuser.alpha_bars[t-1].view(-1, 1, 1, 1).to(device)
+            x_hat = (x_noisy - torch.sqrt(1 - alpha) * noise_pred) / torch.sqrt(alpha)
+
             if loss_type == "mse":
                 loss = F.mse_loss(noise, noise_pred)
+            elif loss_type == "violation":
+                constraint_violation = calculate_r2_penalty(x_hat, labels)
+                loss = penalty_weight * constraint_violation
+            elif loss_type == "combined":
+                loss = F.mse_loss(noise, noise_pred)
+                constraint_violation = calculate_constraint_violation(x_hat)
+                penalty = penalty_weight * constraint_violation
+                loss += penalty
+
+            elif loss_type == "combined_amount":
+                loss = F.mse_loss(noise, noise_pred)
+                constraint_violation = calculate_r2_penalty(x_hat, labels)
+                penalty = penalty_weight * constraint_violation
+                loss += penalty            
 
             loss.backward()
             optimizer.step()
@@ -405,10 +493,10 @@ def objective(trial):
         for key, value in evaluation_results.items():
             f.write(f"{key}: {value}\n")
             
-    return rmse
+    return r2
 
 # Optunaによる最適化
-study = optuna.create_study(direction="minimize")
+study = optuna.create_study(direction="maximize")
 study.optimize(objective, n_trials=30)
 
 # 最適なパラメータの表示
